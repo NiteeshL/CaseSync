@@ -3,6 +3,7 @@ const SEEN_ICS_URLS_AT_LOAD = new Set();
 
 const CASE_REGEX = /\b(?:INC|REQ|RITM|TASK|CHG|PRB|SCTASK|SCREQ)\d{4,}\b/i;
 const URL_REGEX = /(https?:\/\/[^\s<>"']+)/i;
+const URL_GLOBAL_REGEX = /(https?:\/\/[^\s<>"']+)/g;
 
 function normalizeUrl(url) {
   try {
@@ -54,6 +55,15 @@ function unfoldIcsLines(raw) {
   return unfolded;
 }
 
+function decodeIcsText(value) {
+  return value
+    .replace(/\\n/gi, "\n")
+    .replace(/\\,/g, ",")
+    .replace(/\\;/g, ";")
+    .replace(/\\\\/g, "\\")
+    .trim();
+}
+
 function parseEventFromIcs(rawIcs) {
   const lines = unfoldIcsLines(rawIcs);
   let summary = "";
@@ -75,7 +85,7 @@ function parseEventFromIcs(rawIcs) {
 
   return {
     summary,
-    description: description.replace(/\\n/g, "\n"),
+    description: decodeIcsText(description),
     dtStartRaw,
     dtEndRaw
   };
@@ -86,6 +96,7 @@ function formatAsIsoDateTime(icsDateValue) {
     return "";
   }
 
+  const isUtc = /Z$/.test(icsDateValue.trim());
   const cleaned = icsDateValue.replace(/Z$/, "").trim();
   const compact = cleaned.replace(/[^0-9T]/g, "");
 
@@ -93,7 +104,7 @@ function formatAsIsoDateTime(icsDateValue) {
     const yyyy = compact.slice(0, 4);
     const mm = compact.slice(4, 6);
     const dd = compact.slice(6, 8);
-    return `${yyyy}-${mm}-${dd}T00:00:00`;
+    return `${yyyy}-${mm}-${dd}T00:00:00${isUtc ? "Z" : ""}`;
   }
 
   if (/^\d{8}T\d{6}$/.test(compact)) {
@@ -103,10 +114,15 @@ function formatAsIsoDateTime(icsDateValue) {
     const hh = compact.slice(9, 11);
     const min = compact.slice(11, 13);
     const ss = compact.slice(13, 15);
-    return `${yyyy}-${mm}-${dd}T${hh}:${min}:${ss}`;
+    return `${yyyy}-${mm}-${dd}T${hh}:${min}:${ss}${isUtc ? "Z" : ""}`;
   }
 
   return "";
+}
+
+function extractTopic(description) {
+  const match = description.match(/^Topic:\s*(.+)$/mi);
+  return match ? match[1].trim() : "";
 }
 
 function extractCaseNumber(summary, description) {
@@ -120,26 +136,43 @@ function extractCaseNumber(summary, description) {
 }
 
 function extractMeetingLink(description) {
-  const match = description.match(URL_REGEX);
-  return match ? match[1] : "";
+  const urls = description.match(URL_GLOBAL_REGEX) || [];
+  if (urls.length === 0) {
+    return "";
+  }
+
+  const meetingUrl = urls.find((url) => /zoom|teams|meet\.google|webex/i.test(url));
+  return meetingUrl || urls[0];
+}
+
+function extractPassword(description) {
+  const match = description.match(/^Password:\s*(.+)$/mi);
+  return match ? match[1].trim() : "";
 }
 
 function buildOutlookDeeplink(eventData) {
-  const { summary, description, startdt, enddt, caseNumber, meetingLink } = eventData;
-  const subject = caseNumber && !summary.includes(caseNumber)
-    ? `${summary} [${caseNumber}]`
-    : summary;
+  const { summary, topic, description, startdt, enddt, caseNumber, meetingLink, password } = eventData;
+  const titleSource = topic || summary;
+  const subject = caseNumber && titleSource && !titleSource.includes(caseNumber)
+    ? `${titleSource} [${caseNumber}]`
+    : (titleSource || "ServiceNow Meeting");
 
   const bodyParts = [];
+  if (topic) {
+    bodyParts.push(`Topic: ${topic}`);
+  }
   if (description) {
     bodyParts.push(description);
   }
   if (meetingLink && !description.includes(meetingLink)) {
     bodyParts.push(`Meeting Link: ${meetingLink}`);
   }
+  if (password && !description.includes(`Password: ${password}`)) {
+    bodyParts.push(`Password: ${password}`);
+  }
 
   const params = new URLSearchParams({
-    subject: subject || "ServiceNow Meeting",
+    subject,
     startdt,
     enddt,
     body: bodyParts.join("\n\n"),
@@ -182,15 +215,19 @@ async function processIcsUrl(rawUrl) {
     }
 
     const caseNumber = extractCaseNumber(parsed.summary, parsed.description);
+    const topic = extractTopic(parsed.description);
     const meetingLink = extractMeetingLink(parsed.description);
+    const password = extractPassword(parsed.description);
 
     const deeplink = buildOutlookDeeplink({
       summary: parsed.summary,
+      topic,
       description: parsed.description,
       startdt,
       enddt,
       caseNumber,
-      meetingLink
+      meetingLink,
+      password
     });
 
     chrome.runtime.sendMessage({
