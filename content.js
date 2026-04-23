@@ -760,12 +760,6 @@ async function init() {
     document.addEventListener("DOMContentLoaded", injectRunningBadge, { once: true });
   }
 
-  const isServiceNowHost = /(?:^|\.)service-now\.com$/i.test(window.location.hostname);
-  if (!isServiceNowHost) {
-    logDebug("Host is not ServiceNow; monitor not enabled", { host: window.location.hostname });
-    return;
-  }
-
   await loadSeenSysIds();
   installFetchMonitor();
   installXhrMonitor();
