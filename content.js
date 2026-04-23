@@ -1,293 +1,737 @@
-const PROCESSED_ICS_URLS = new Set();
-const SEEN_ICS_URLS_AT_LOAD = new Set();
-
-const CASE_REGEX = /\b(?:INC|REQ|RITM|TASK|CHG|PRB|SCTASK|SCREQ)\d{4,}\b/i;
-const URL_REGEX = /(https?:\/\/[^\s<>"']+)/i;
+const OUTLOOK_BASE_URL = "https://outlook.office.com/calendar/0/deeplink/compose";
 const URL_GLOBAL_REGEX = /(https?:\/\/[^\s<>"']+)/g;
+const SCHEDULE_WINDOW_MS = 12000;
+const DEDUP_STORAGE_KEY = "capturedJournalSysIds";
+const LOG_BODY_PREVIEW_LEN = 220;
+const LOG_PREFIX = "[SN MEETING]";
+const INSTANCE_ID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+const HEARTBEAT_MS = 30000;
+const INIT_GUARD_KEY = "__SN_MEETING_MONITOR_INITIALIZED__";
+
+function getFrameKind() {
+  try {
+    return window.top === window ? "top" : "iframe";
+  } catch (_) {
+    return "iframe";
+  }
+}
+
+const FRAME_KIND = getFrameKind();
+
+console.info(`${LOG_PREFIX} content.js evaluated`, {
+  instanceId: INSTANCE_ID,
+  href: window.location.href,
+  frameKind: FRAME_KIND
+});
+
+let pendingSchedule = null;
+let seenJournalSysIds = new Set();
+
+function logDebug(message, extra) {
+  const scopedPrefix = `${LOG_PREFIX} [${INSTANCE_ID}] [${FRAME_KIND}]`;
+  if (extra !== undefined) {
+    console.log(`${scopedPrefix} ${message}`, extra);
+    return;
+  }
+  console.log(`${scopedPrefix} ${message}`);
+}
+
+function startHeartbeat() {
+  window.setInterval(() => {
+    logDebug("Heartbeat: extension monitor still running", {
+      href: window.location.href
+    });
+  }, HEARTBEAT_MS);
+}
+
+function injectRunningBadge() {
+  if (FRAME_KIND !== "top") {
+    return;
+  }
+
+  if (!document.body) {
+    return;
+  }
+
+  const badgeId = "sn-meeting-extension-running-badge";
+  if (document.getElementById(badgeId)) {
+    return;
+  }
+
+  const badge = document.createElement("div");
+  badge.id = badgeId;
+  badge.textContent = `${LOG_PREFIX} running`;
+  badge.style.position = "fixed";
+  badge.style.right = "12px";
+  badge.style.bottom = "12px";
+  badge.style.zIndex = "2147483647";
+  badge.style.padding = "6px 10px";
+  badge.style.fontSize = "12px";
+  badge.style.fontFamily = "ui-monospace, SFMono-Regular, Menlo, monospace";
+  badge.style.color = "#ffffff";
+  badge.style.background = "#0078d4";
+  badge.style.borderRadius = "8px";
+  badge.style.boxShadow = "0 2px 6px rgba(0,0,0,0.25)";
+  badge.style.pointerEvents = "none";
+  badge.style.opacity = "0.95";
+  document.body.appendChild(badge);
+}
+
+function shortText(value, maxLen = LOG_BODY_PREVIEW_LEN) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  if (text.length <= maxLen) {
+    return text;
+  }
+  return `${text.slice(0, maxLen)}...`;
+}
 
 function normalizeUrl(url) {
   try {
-    const parsed = new URL(url, window.location.href);
-    parsed.hash = "";
-    return parsed.toString();
+    return new URL(url, window.location.href).toString();
   } catch (_) {
     return String(url || "");
   }
 }
 
-function isIcsAnchor(anchor) {
-  if (!(anchor instanceof HTMLAnchorElement)) {
-    return false;
-  }
-
-  const href = anchor.getAttribute("href") || "";
-  const text = (anchor.textContent || "").toLowerCase();
-  const fullUrl = normalizeUrl(href).toLowerCase();
-
-  if (fullUrl.includes(".ics") || href.toLowerCase().includes(".ics")) {
-    return true;
-  }
-
-  if (text.includes(".ics") || text.includes("text/calendar")) {
-    return true;
-  }
-
-  if (fullUrl.includes("sys_attachment.do") && /filename=.*\.ics|file_name=.*\.ics/.test(fullUrl)) {
-    return true;
-  }
-
-  return false;
-}
-
-function unfoldIcsLines(raw) {
-  const normalized = raw.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-  const lines = normalized.split("\n");
-  const unfolded = [];
-
-  for (const line of lines) {
-    if (/^[ \t]/.test(line) && unfolded.length > 0) {
-      unfolded[unfolded.length - 1] += line.slice(1);
-    } else {
-      unfolded.push(line);
-    }
-  }
-
-  return unfolded;
-}
-
-function decodeIcsText(value) {
-  return value
-    .replace(/\\n/gi, "\n")
-    .replace(/\\,/g, ",")
-    .replace(/\\;/g, ";")
-    .replace(/\\\\/g, "\\")
-    .trim();
-}
-
-function parseEventFromIcs(rawIcs) {
-  const lines = unfoldIcsLines(rawIcs);
-  let summary = "";
-  let description = "";
-  let dtStartRaw = "";
-  let dtEndRaw = "";
-
-  for (const line of lines) {
-    if (!summary && line.startsWith("SUMMARY")) {
-      summary = line.split(":").slice(1).join(":").trim();
-    } else if (!description && line.startsWith("DESCRIPTION")) {
-      description = line.split(":").slice(1).join(":").trim();
-    } else if (!dtStartRaw && line.startsWith("DTSTART")) {
-      dtStartRaw = line.split(":").slice(1).join(":").trim();
-    } else if (!dtEndRaw && line.startsWith("DTEND")) {
-      dtEndRaw = line.split(":").slice(1).join(":").trim();
-    }
-  }
-
-  return {
-    summary,
-    description: decodeIcsText(description),
-    dtStartRaw,
-    dtEndRaw
-  };
-}
-
-function formatAsIsoDateTime(icsDateValue) {
-  if (!icsDateValue) {
+function normalizeDateString(dateValue) {
+  if (!dateValue) {
     return "";
   }
 
-  const isUtc = /Z$/.test(icsDateValue.trim());
-  const cleaned = icsDateValue.replace(/Z$/, "").trim();
-  const compact = cleaned.replace(/[^0-9T]/g, "");
-
-  if (/^\d{8}$/.test(compact)) {
-    const yyyy = compact.slice(0, 4);
-    const mm = compact.slice(4, 6);
-    const dd = compact.slice(6, 8);
-    return `${yyyy}-${mm}-${dd}T00:00:00${isUtc ? "Z" : ""}`;
+  const raw = String(dateValue).trim();
+  if (!raw) {
+    return "";
   }
 
-  if (/^\d{8}T\d{6}$/.test(compact)) {
-    const yyyy = compact.slice(0, 4);
-    const mm = compact.slice(4, 6);
-    const dd = compact.slice(6, 8);
-    const hh = compact.slice(9, 11);
-    const min = compact.slice(11, 13);
-    const ss = compact.slice(13, 15);
+  if (/^\d{8}T\d{6}Z?$/.test(raw)) {
+    const isUtc = raw.endsWith("Z");
+    const clean = raw.replace(/Z$/, "");
+    const yyyy = clean.slice(0, 4);
+    const mm = clean.slice(4, 6);
+    const dd = clean.slice(6, 8);
+    const hh = clean.slice(9, 11);
+    const min = clean.slice(11, 13);
+    const ss = clean.slice(13, 15);
     return `${yyyy}-${mm}-${dd}T${hh}:${min}:${ss}${isUtc ? "Z" : ""}`;
   }
 
-  return "";
-}
-
-function extractTopic(description) {
-  const match = description.match(/^Topic:\s*(.+)$/mi);
-  return match ? match[1].trim() : "";
-}
-
-function extractCaseNumber(summary, description) {
-  const summaryMatch = summary.match(CASE_REGEX);
-  if (summaryMatch) {
-    return summaryMatch[0].toUpperCase();
+  if (/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(:\d{2})?(\.\d+)?(Z|[+-]\d{2}:?\d{2})?$/i.test(raw)) {
+    const normalized = raw.replace(" ", "T");
+    return normalized.includes("Z") || /[+-]\d{2}:?\d{2}$/.test(normalized)
+      ? normalized
+      : `${normalized}${normalized.length === 16 ? ":00" : ""}`;
   }
 
-  const descriptionMatch = description.match(CASE_REGEX);
-  return descriptionMatch ? descriptionMatch[0].toUpperCase() : "";
+  const parsed = Date.parse(raw);
+  if (Number.isNaN(parsed)) {
+    return "";
+  }
+
+  return new Date(parsed).toISOString().replace(/\.\d{3}Z$/, "Z");
 }
 
-function extractMeetingLink(description) {
-  const urls = description.match(URL_GLOBAL_REGEX) || [];
+function parseServiceNowDateToMs(value) {
+  if (!value) {
+    return NaN;
+  }
+
+  const raw = String(value).trim();
+  if (!raw) {
+    return NaN;
+  }
+
+  const direct = Date.parse(raw);
+  if (!Number.isNaN(direct)) {
+    return direct;
+  }
+
+  const match = raw.match(/^(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})$/);
+  if (match) {
+    const localGuess = Date.parse(`${match[1]}T${match[2]}`);
+    if (!Number.isNaN(localGuess)) {
+      return localGuess;
+    }
+  }
+
+  logDebug("Unable to parse ServiceNow date", { value: raw });
+  return NaN;
+}
+
+function extractCaseSysIdFromPage() {
+  const url = new URL(window.location.href);
+  const direct = url.searchParams.get("sys_id");
+  if (direct) {
+    return direct;
+  }
+
+  const uri = url.searchParams.get("uri") || "";
+  const embeddedMatch = uri.match(/[?&]sys_id=([a-f0-9]{32})/i);
+  return embeddedMatch ? embeddedMatch[1] : "";
+}
+
+function extractScheduleFieldsFromBody(body) {
+  const result = {
+    topic: "",
+    startdt: "",
+    enddt: ""
+  };
+
+  const assignIfMatches = (key, value) => {
+    if (value == null) {
+      return;
+    }
+
+    const normalizedValue = String(value).trim();
+    if (!normalizedValue) {
+      return;
+    }
+
+    if (!result.topic && /(topic|subject|title|meeting_name|meetingTopic)/i.test(key)) {
+      result.topic = normalizedValue;
+    }
+
+    if (!result.startdt && /(start|begin|from|start_time|startTime|meeting_start|meetingStart)/i.test(key)) {
+      result.startdt = normalizeDateString(normalizedValue);
+    }
+
+    if (!result.enddt && /(end|to|finish|end_time|endTime|meeting_end|meetingEnd)/i.test(key)) {
+      result.enddt = normalizeDateString(normalizedValue);
+    }
+  };
+
+  if (!body) {
+    logDebug("Schedule POST body missing");
+    return result;
+  }
+
+  if (typeof body === "string") {
+    const text = body.trim();
+    if (!text) {
+      return result;
+    }
+
+    try {
+      const parsedJson = JSON.parse(text);
+      const stack = [parsedJson];
+      while (stack.length > 0) {
+        const current = stack.pop();
+        if (!current || typeof current !== "object") {
+          continue;
+        }
+
+        for (const [key, value] of Object.entries(current)) {
+          if (value && typeof value === "object") {
+            stack.push(value);
+          } else {
+            assignIfMatches(key, value);
+          }
+        }
+      }
+      logDebug("Extracted schedule fields from JSON body", result);
+      return result;
+    } catch (_) {
+      const params = new URLSearchParams(text);
+      for (const [key, value] of params.entries()) {
+        assignIfMatches(key, value);
+      }
+      logDebug("Extracted schedule fields from URL-encoded body", result);
+      return result;
+    }
+  }
+
+  if (typeof FormData !== "undefined" && body instanceof FormData) {
+    for (const [key, value] of body.entries()) {
+      assignIfMatches(key, value);
+    }
+  }
+
+  if (typeof URLSearchParams !== "undefined" && body instanceof URLSearchParams) {
+    for (const [key, value] of body.entries()) {
+      assignIfMatches(key, value);
+    }
+  }
+
+  logDebug("Extracted schedule fields from non-string body", result);
+
+  return result;
+}
+
+function isMeetingSchedulePost(url, method, bodyText) {
+  if (method !== "POST") {
+    return false;
+  }
+
+  const loweredUrl = url.toLowerCase();
+  const loweredBody = (bodyText || "").toLowerCase();
+
+  const urlSignal = /(zoom|teams|meeting|schedule|calendar)/.test(loweredUrl);
+  const bodySignal = /(zoom|teams|meeting|schedule|topic|start_time|end_time|join_url)/.test(loweredBody);
+
+  const matched = urlSignal || bodySignal;
+  logDebug("Evaluated meeting POST candidate", {
+    method,
+    url,
+    matched,
+    urlSignal,
+    bodySignal,
+    bodyPreview: shortText(bodyText)
+  });
+  return matched;
+}
+
+function isListHistoryRequest(url) {
+  return /\/list_history\.do(\?|$)/i.test(url);
+}
+
+function getMeetingUrl(text) {
+  const urls = text.match(URL_GLOBAL_REGEX) || [];
   if (urls.length === 0) {
     return "";
   }
 
-  const meetingUrl = urls.find((url) => /zoom|teams|meet\.google|webex/i.test(url));
-  return meetingUrl || urls[0];
+  const preferred = urls.find((url) => /zoom|teams|meet\.google|webex/i.test(url));
+  return preferred || urls[0];
 }
 
-function extractPassword(description) {
-  const match = description.match(/^Password:\s*(.+)$/mi);
+function getPassword(text) {
+  const match = text.match(/^Password:\s*(.+)$/mi);
   return match ? match[1].trim() : "";
 }
 
-function buildOutlookDeeplink(eventData) {
-  const { summary, topic, description, startdt, enddt, caseNumber, meetingLink, password } = eventData;
-  const titleSource = topic || summary;
-  const subject = caseNumber && titleSource && !titleSource.includes(caseNumber)
-    ? `${titleSource} [${caseNumber}]`
-    : (titleSource || "ServiceNow Meeting");
+function getTopic(text) {
+  const match = text.match(/^Topic:\s*(.+)$/mi);
+  return match ? match[1].trim() : "";
+}
 
+function getSubjectFromJournal(text) {
+  return getTopic(text) || pendingSchedule?.topic || "ServiceNow Meeting";
+}
+
+function buildOutlookDeeplink(details) {
   const bodyParts = [];
-  if (topic) {
-    bodyParts.push(`Topic: ${topic}`);
+  if (details.journalText) {
+    bodyParts.push(details.journalText);
   }
-  if (description) {
-    bodyParts.push(description);
+  if (details.meetingLink && !details.journalText.includes(details.meetingLink)) {
+    bodyParts.push(`Meeting Link: ${details.meetingLink}`);
   }
-  if (meetingLink && !description.includes(meetingLink)) {
-    bodyParts.push(`Meeting Link: ${meetingLink}`);
-  }
-  if (password && !description.includes(`Password: ${password}`)) {
-    bodyParts.push(`Password: ${password}`);
+  if (details.password && !details.journalText.includes(`Password: ${details.password}`)) {
+    bodyParts.push(`Password: ${details.password}`);
   }
 
   const params = new URLSearchParams({
-    subject,
-    startdt,
-    enddt,
+    subject: details.subject,
+    startdt: details.startdt,
+    enddt: details.enddt,
     body: bodyParts.join("\n\n"),
     location: "Online",
     online: "1"
   });
 
-  return `https://outlook.office.com/calendar/0/deeplink/compose?${params.toString()}`;
+  return `${OUTLOOK_BASE_URL}?${params.toString()}`;
 }
 
-async function fetchIcsText(icsUrl) {
-  const response = await fetch(icsUrl, {
-    credentials: "include"
+function sendOutlookOpen(url) {
+  logDebug("Sending deeplink open request to background", {
+    urlPreview: shortText(url, 300)
   });
+  chrome.runtime.sendMessage({
+    type: "OPEN_OUTLOOK_DEEPLINK",
+    url
+  });
+}
 
-  if (!response.ok) {
-    throw new Error(`Failed to fetch ICS file: ${response.status}`);
+function flattenObjects(root) {
+  const items = [];
+  const stack = [root];
+
+  while (stack.length > 0) {
+    const current = stack.pop();
+    if (!current || typeof current !== "object") {
+      continue;
+    }
+
+    items.push(current);
+
+    if (Array.isArray(current)) {
+      for (const item of current) {
+        if (item && typeof item === "object") {
+          stack.push(item);
+        }
+      }
+    } else {
+      for (const value of Object.values(current)) {
+        if (value && typeof value === "object") {
+          stack.push(value);
+        }
+      }
+    }
   }
 
-  return response.text();
+  return items;
 }
 
-async function processIcsUrl(rawUrl) {
-  const icsUrl = normalizeUrl(rawUrl);
-  if (!icsUrl || PROCESSED_ICS_URLS.has(icsUrl) || SEEN_ICS_URLS_AT_LOAD.has(icsUrl)) {
+function getJournalTextFromNode(node) {
+  const keys = [
+    "value",
+    "new_value",
+    "display_value",
+    "comments",
+    "work_notes",
+    "text",
+    "entry",
+    "message",
+    "journal"
+  ];
+
+  for (const key of keys) {
+    if (typeof node[key] === "string" && node[key].trim()) {
+      return node[key].trim();
+    }
+  }
+
+  return "";
+}
+
+function isCommentsOrWorkNotesNode(node) {
+  const keys = ["element", "field", "name", "type", "journal_type"];
+  for (const key of keys) {
+    if (typeof node[key] !== "string") {
+      continue;
+    }
+
+    const value = node[key].toLowerCase();
+    if (value.includes("comments") || value.includes("work_notes") || value.includes("work notes")) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function extractJournalEntries(payload) {
+  const allNodes = flattenObjects(payload);
+  const entries = [];
+
+  for (const node of allNodes) {
+    if (!node || typeof node !== "object") {
+      continue;
+    }
+
+    const sysId = typeof node.sys_id === "string" ? node.sys_id : "";
+    const created = typeof node.sys_created_on_adjusted === "string" ? node.sys_created_on_adjusted : "";
+    const text = getJournalTextFromNode(node);
+
+    if (!sysId || !created || !text) {
+      continue;
+    }
+
+    if (!isCommentsOrWorkNotesNode(node)) {
+      continue;
+    }
+
+    entries.push({
+      sysId,
+      created,
+      text
+    });
+  }
+
+  logDebug("Extracted journal entries from list_history payload", {
+    count: entries.length
+  });
+  return entries;
+}
+
+function isWithinPendingWindow(createdMs) {
+  if (!pendingSchedule) {
+    return false;
+  }
+
+  const deltaMs = Math.abs(createdMs - pendingSchedule.timestamp);
+  const within = deltaMs <= SCHEDULE_WINDOW_MS;
+  logDebug("Timestamp gate evaluated", {
+    createdMs,
+    pendingTimestamp: pendingSchedule.timestamp,
+    deltaMs,
+    windowMs: SCHEDULE_WINDOW_MS,
+    within
+  });
+  return within;
+}
+
+async function persistSeenSysIds() {
+  const ids = Array.from(seenJournalSysIds);
+  await chrome.storage.local.set({ [DEDUP_STORAGE_KEY]: ids.slice(-500) });
+  logDebug("Persisted dedup sys_id cache", { size: Math.min(ids.length, 500) });
+}
+
+async function markSysIdSeen(sysId) {
+  seenJournalSysIds.add(sysId);
+  await persistSeenSysIds();
+}
+
+function parseJsonSafely(text) {
+  try {
+    return JSON.parse(text);
+  } catch (_) {
+    logDebug("Failed to parse list_history response as JSON", {
+      preview: shortText(text)
+    });
+    return null;
+  }
+}
+
+async function processHistoryResponse(responseText, sourceUrl) {
+  if (!pendingSchedule) {
+    logDebug("Ignoring list_history because no pending schedule exists", { sourceUrl });
     return;
   }
 
-  PROCESSED_ICS_URLS.add(icsUrl);
+  logDebug("Processing list_history response", {
+    sourceUrl,
+    responseLength: responseText.length,
+    pendingSchedule
+  });
 
-  try {
-    const icsText = await fetchIcsText(icsUrl);
-    const parsed = parseEventFromIcs(icsText);
+  const payload = parseJsonSafely(responseText);
+  if (!payload) {
+    logDebug("Skipping list_history response due to invalid JSON", { sourceUrl });
+    return;
+  }
 
-    const startdt = formatAsIsoDateTime(parsed.dtStartRaw);
-    const enddt = formatAsIsoDateTime(parsed.dtEndRaw);
+  const entries = extractJournalEntries(payload);
+  if (entries.length === 0) {
+    logDebug("list_history parsed but no journal entries found", sourceUrl);
+    return;
+  }
 
-    if (!startdt || !enddt) {
-      throw new Error("Invalid DTSTART/DTEND format in ICS.");
+  for (const entry of entries) {
+    if (seenJournalSysIds.has(entry.sysId)) {
+      logDebug("Skipping journal entry: sys_id already processed", { sysId: entry.sysId });
+      continue;
     }
 
-    const caseNumber = extractCaseNumber(parsed.summary, parsed.description);
-    const topic = extractTopic(parsed.description);
-    const meetingLink = extractMeetingLink(parsed.description);
-    const password = extractPassword(parsed.description);
+    const createdMs = parseServiceNowDateToMs(entry.created);
+    if (Number.isNaN(createdMs) || !isWithinPendingWindow(createdMs)) {
+      logDebug("Skipping journal entry: outside timestamp window", {
+        sysId: entry.sysId,
+        created: entry.created
+      });
+      continue;
+    }
+
+    const subject = getSubjectFromJournal(entry.text);
+    const meetingLink = getMeetingUrl(entry.text);
+    const password = getPassword(entry.text);
+
+    const startdt = pendingSchedule.startdt || "";
+    const enddt = pendingSchedule.enddt || "";
+
+    if (!startdt || !enddt) {
+      logDebug("Skipping matched journal because schedule POST did not expose start/end", pendingSchedule);
+      continue;
+    }
 
     const deeplink = buildOutlookDeeplink({
-      summary: parsed.summary,
-      topic,
-      description: parsed.description,
+      subject,
       startdt,
       enddt,
-      caseNumber,
+      journalText: entry.text,
       meetingLink,
       password
     });
 
-    chrome.runtime.sendMessage({
-      type: "OPEN_OUTLOOK_DEEPLINK",
-      url: deeplink
+    await markSysIdSeen(entry.sysId);
+    sendOutlookOpen(deeplink);
+    logDebug("Opened Outlook from matched journal entry", {
+      sysId: entry.sysId,
+      created: entry.created
     });
-  } catch (error) {
-    console.error("ServiceNow ICS to Outlook: failed to process ICS", error);
+
+    pendingSchedule = null;
+    logDebug("Cleared pending schedule after successful Outlook open");
+    break;
   }
 }
 
-function getIcsAnchorsFromNode(node) {
-  if (!(node instanceof Element)) {
-    return [];
+function getRequestBodyText(body) {
+  if (typeof body === "string") {
+    return body;
   }
 
-  const anchors = [];
-
-  if (node instanceof HTMLAnchorElement) {
-    anchors.push(node);
+  if (body instanceof URLSearchParams) {
+    return body.toString();
   }
 
-  anchors.push(...node.querySelectorAll("a[href]"));
-  return anchors.filter(isIcsAnchor);
+  return "";
 }
 
-function markExistingIcsLinksAsSeen() {
-  const existingAnchors = document.querySelectorAll("a[href]");
-  for (const anchor of existingAnchors) {
-    if (isIcsAnchor(anchor)) {
-      SEEN_ICS_URLS_AT_LOAD.add(normalizeUrl(anchor.href));
+function startPendingSchedule(method, url, body) {
+  const bodyText = getRequestBodyText(body);
+  if (!isMeetingSchedulePost(url, method, bodyText)) {
+    if (method === "POST") {
+      logDebug("POST ignored (did not match meeting pattern)", {
+        url,
+        bodyPreview: shortText(bodyText)
+      });
     }
+    return;
   }
+
+  const fields = extractScheduleFieldsFromBody(body);
+  if (!fields.startdt || !fields.enddt) {
+    logDebug("Meeting-like POST found but missing start/end fields", {
+      url,
+      fields,
+      bodyPreview: shortText(bodyText)
+    });
+    return;
+  }
+
+  pendingSchedule = {
+    timestamp: Date.now(),
+    requestUrl: url,
+    caseSysId: extractCaseSysIdFromPage(),
+    topic: fields.topic,
+    startdt: fields.startdt,
+    enddt: fields.enddt
+  };
+
+  logDebug("Captured pending meeting schedule POST", pendingSchedule);
 }
 
-function setupObserver() {
-  const observer = new MutationObserver((mutations) => {
-    for (const mutation of mutations) {
-      for (const addedNode of mutation.addedNodes) {
-        const anchors = getIcsAnchorsFromNode(addedNode);
-        for (const anchor of anchors) {
-          processIcsUrl(anchor.href);
-        }
+function installFetchMonitor() {
+  const originalFetch = window.fetch.bind(window);
+  logDebug("Installing fetch monitor");
+
+  window.fetch = async (...args) => {
+    const input = args[0];
+    const init = args[1] || {};
+
+    const requestUrl = normalizeUrl(typeof input === "string" ? input : input?.url);
+    const method = String(init.method || input?.method || "GET").toUpperCase();
+
+    if (method === "POST" || isListHistoryRequest(requestUrl)) {
+      logDebug("Fetch observed", {
+        method,
+        requestUrl,
+        bodyPreview: shortText(getRequestBodyText(init.body || input?.body))
+      });
+    }
+
+    startPendingSchedule(method, requestUrl, init.body || input?.body);
+
+    const response = await originalFetch(...args);
+
+    if (isListHistoryRequest(requestUrl)) {
+      logDebug("Fetch list_history response received", {
+        requestUrl,
+        status: response.status
+      });
+      response.clone().text()
+        .then((text) => processHistoryResponse(text, requestUrl))
+        .catch((error) => {
+          logDebug("Failed reading fetch list_history response body", { requestUrl, error: String(error) });
+        });
+    }
+
+    return response;
+  };
+}
+
+function installXhrMonitor() {
+  const originalOpen = XMLHttpRequest.prototype.open;
+  const originalSend = XMLHttpRequest.prototype.send;
+  logDebug("Installing XHR monitor");
+
+  XMLHttpRequest.prototype.open = function (method, url, ...rest) {
+    this.__snMeetingMethod = String(method || "GET").toUpperCase();
+    this.__snMeetingUrl = normalizeUrl(url);
+    return originalOpen.call(this, method, url, ...rest);
+  };
+
+  XMLHttpRequest.prototype.send = function (body) {
+    const method = this.__snMeetingMethod || "GET";
+    const url = this.__snMeetingUrl || "";
+
+    if (method === "POST" || isListHistoryRequest(url)) {
+      logDebug("XHR observed", {
+        method,
+        url,
+        bodyPreview: shortText(getRequestBodyText(body))
+      });
+    }
+
+    startPendingSchedule(method, url, body);
+
+    this.addEventListener("load", () => {
+      if (!isListHistoryRequest(url)) {
+        return;
       }
-    }
+
+      logDebug("XHR list_history response received", {
+        url,
+        status: this.status
+      });
+
+      if (typeof this.responseText !== "string" || !this.responseText.trim()) {
+        logDebug("XHR list_history empty responseText", { url });
+        return;
+      }
+
+      processHistoryResponse(this.responseText, url).catch((error) => {
+        logDebug("Failed processing XHR list_history response", { url, error: String(error) });
+      });
+    });
+
+    return originalSend.call(this, body);
+  };
+}
+
+async function loadSeenSysIds() {
+  const stored = await chrome.storage.local.get(DEDUP_STORAGE_KEY);
+  const values = Array.isArray(stored[DEDUP_STORAGE_KEY]) ? stored[DEDUP_STORAGE_KEY] : [];
+  seenJournalSysIds = new Set(values.filter((item) => typeof item === "string" && item));
+  logDebug("Loaded journal sys_id dedup cache", { size: seenJournalSysIds.size });
+}
+
+async function init() {
+  console.info(`${LOG_PREFIX} Extension content script loaded`, {
+    instanceId: INSTANCE_ID,
+    frameKind: FRAME_KIND,
+    href: window.location.href,
+    host: window.location.hostname
   });
 
-  observer.observe(document.body, {
-    childList: true,
-    subtree: true
-  });
+  if (window[INIT_GUARD_KEY]) {
+    logDebug("Init skipped: monitor already initialized in this frame");
+    return;
+  }
+  window[INIT_GUARD_KEY] = true;
+  logDebug("Init guard set for frame");
+
+  logDebug("Content script init started", { href: window.location.href });
+
+  if (document.readyState === "complete" || document.readyState === "interactive") {
+    injectRunningBadge();
+  } else {
+    document.addEventListener("DOMContentLoaded", injectRunningBadge, { once: true });
+  }
+
+  const isServiceNowHost = /(?:^|\.)service-now\.com$/i.test(window.location.hostname);
+  if (!isServiceNowHost) {
+    logDebug("Host is not ServiceNow; monitor not enabled", { host: window.location.hostname });
+    return;
+  }
+
+  await loadSeenSysIds();
+  installFetchMonitor();
+  installXhrMonitor();
+  startHeartbeat();
+  logDebug("Meeting monitor initialized", { href: window.location.href });
 }
 
-function init() {
-  markExistingIcsLinksAsSeen();
-  setupObserver();
-}
-
-if (document.readyState === "loading") {
-  document.addEventListener("DOMContentLoaded", init, { once: true });
-} else {
-  init();
-}
+init().catch((error) => {
+  console.error("ServiceNow meeting monitor failed to initialize", error);
+});

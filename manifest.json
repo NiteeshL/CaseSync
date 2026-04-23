@@ -1,11 +1,11 @@
 {
   "manifest_version": 3,
   "name": "ServiceNow ICS to Outlook",
-  "version": "1.0.0",
-  "description": "Detects .ics invites in ServiceNow Work Notes and opens a pre-filled Outlook Web event.",
-  "permissions": ["tabs"],
+  "version": "1.1.0",
+  "description": "Detects meeting scheduling requests in ServiceNow and opens a pre-filled Outlook Web event.",
+  "permissions": ["tabs", "storage"],
   "host_permissions": [
-    "*://*.service-now.com/*",
+    "<all_urls>",
     "*://outlook.office.com/*"
   ],
   "background": {
@@ -13,9 +13,10 @@
   },
   "content_scripts": [
     {
-      "matches": ["*://*.service-now.com/*"],
+      "matches": ["<all_urls>"],
       "js": ["content.js"],
-      "run_at": "document_idle"
+      "run_at": "document_idle",
+      "all_frames": true
     }
   ]
 }
