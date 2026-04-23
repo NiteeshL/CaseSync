@@ -5,7 +5,10 @@
   "description": "Detects meeting scheduling requests in ServiceNow and opens a pre-filled Outlook Web event.",
   "permissions": ["tabs", "storage"],
   "host_permissions": [
-    "<all_urls>",
+    "*://servicenow.com/*",
+    "*://*.servicenow.com/*",
+    "*://service-now.com/*",
+    "*://*.service-now.com/*",
     "*://outlook.office.com/*"
   ],
   "background": {
@@ -13,7 +16,12 @@
   },
   "content_scripts": [
     {
-      "matches": ["<all_urls>"],
+      "matches": [
+        "*://servicenow.com/*",
+        "*://*.servicenow.com/*",
+        "*://service-now.com/*",
+        "*://*.service-now.com/*"
+      ],
       "js": ["content.js"],
       "run_at": "document_idle",
       "all_frames": true

@@ -1,6 +1,7 @@
 const OUTLOOK_BASE_URL = "https://outlook.office.com/calendar/0/deeplink/compose";
 const URL_GLOBAL_REGEX = /(https?:\/\/[^\s<>"']+)/g;
-const SCHEDULE_WINDOW_MS = 12000;
+const SCHEDULE_WINDOW_MS = 7000;
+const PENDING_SCHEDULE_TTL_MS = 20000;
 const DEDUP_STORAGE_KEY = "capturedJournalSysIds";
 const LOG_BODY_PREVIEW_LEN = 220;
 const LOG_PREFIX = "[SN MEETING]";
@@ -173,7 +174,8 @@ function extractScheduleFieldsFromBody(body) {
   const result = {
     topic: "",
     startdt: "",
-    enddt: ""
+    enddt: "",
+    caseSysId: ""
   };
 
   const assignIfMatches = (key, value) => {
@@ -196,6 +198,13 @@ function extractScheduleFieldsFromBody(body) {
 
     if (!result.enddt && /(end|to|finish|end_time|endTime|meeting_end|meetingEnd)/i.test(key)) {
       result.enddt = normalizeDateString(normalizedValue);
+    }
+
+    if (!result.caseSysId && /(u_case_zoom_schedule\.u_case|u_case|case_sys_id|case)/i.test(key)) {
+      const sysIdMatch = normalizedValue.match(/\b[a-f0-9]{32}\b/i);
+      if (sysIdMatch) {
+        result.caseSysId = sysIdMatch[0];
+      }
     }
   };
 
@@ -261,16 +270,22 @@ function isMeetingSchedulePost(url, method, bodyText) {
     return false;
   }
 
-  const loweredUrl = url.toLowerCase();
+  const normalized = normalizeUrl(url);
+  const loweredUrl = normalized.toLowerCase();
   const loweredBody = (bodyText || "").toLowerCase();
 
-  const urlSignal = /(zoom|teams|meeting|schedule|calendar)/.test(loweredUrl);
-  const bodySignal = /(zoom|teams|meeting|schedule|topic|start_time|end_time|join_url)/.test(loweredBody);
+  const isZoomScheduleEndpoint = /\/u_case_zoom_schedule\.do(?:\?|$)/.test(loweredUrl);
+  const hasRequiredBodySignals =
+    loweredBody.includes("sys_target=u_case_zoom_schedule") ||
+    (loweredBody.includes("u_case_zoom_schedule.u_start_date_time") && loweredBody.includes("u_case_zoom_schedule.u_end_date_time"));
+
+  const urlSignal = isZoomScheduleEndpoint;
+  const bodySignal = hasRequiredBodySignals;
 
   const matched = urlSignal || bodySignal;
   logDebug("Evaluated meeting POST candidate", {
     method,
-    url,
+    url: normalized,
     matched,
     urlSignal,
     bodySignal,
@@ -394,7 +409,7 @@ function getJournalTextFromNode(node) {
 }
 
 function isCommentsOrWorkNotesNode(node) {
-  const keys = ["element", "field", "name", "type", "journal_type"];
+  const keys = ["element", "field", "name", "type", "journal_type", "field_name", "field_label"];
   for (const key of keys) {
     if (typeof node[key] !== "string") {
       continue;
@@ -430,6 +445,10 @@ function extractJournalEntries(payload) {
       continue;
     }
 
+    if (!/scheduled\s+zoom\s+meeting|join\s+from\s+pc|topic:/i.test(text)) {
+      continue;
+    }
+
     entries.push({
       sysId,
       created,
@@ -460,6 +479,23 @@ function isWithinPendingWindow(createdMs) {
   return within;
 }
 
+function isPendingScheduleFresh() {
+  if (!pendingSchedule) {
+    return false;
+  }
+
+  const ageMs = Date.now() - pendingSchedule.timestamp;
+  const fresh = ageMs <= PENDING_SCHEDULE_TTL_MS;
+  if (!fresh) {
+    logDebug("Pending schedule expired", {
+      ageMs,
+      ttlMs: PENDING_SCHEDULE_TTL_MS,
+      pendingSchedule
+    });
+  }
+  return fresh;
+}
+
 async function persistSeenSysIds() {
   const ids = Array.from(seenJournalSysIds);
   await chrome.storage.local.set({ [DEDUP_STORAGE_KEY]: ids.slice(-500) });
@@ -485,6 +521,11 @@ function parseJsonSafely(text) {
 async function processHistoryResponse(responseText, sourceUrl) {
   if (!pendingSchedule) {
     logDebug("Ignoring list_history because no pending schedule exists", { sourceUrl });
+    return;
+  }
+
+  if (!isPendingScheduleFresh()) {
+    pendingSchedule = null;
     return;
   }
 
@@ -592,7 +633,7 @@ function startPendingSchedule(method, url, body) {
   pendingSchedule = {
     timestamp: Date.now(),
     requestUrl: url,
-    caseSysId: extractCaseSysIdFromPage(),
+    caseSysId: fields.caseSysId || extractCaseSysIdFromPage(),
     topic: fields.topic,
     startdt: fields.startdt,
     enddt: fields.enddt
